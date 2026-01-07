@@ -54,6 +54,7 @@ def _try_import_subtitles():
 
 
 def _try_import_burn():
+    candidates = [
         ("subtitles_burn", "burn_subtitles"),
         ("subtitles", "burn_subtitles"),
         ("subtitle", "burn_subtitles"),
