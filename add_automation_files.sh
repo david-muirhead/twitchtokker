@@ -1,65 +1,25 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-echo "📦 Adding automation files to existing repo..."
+echo "✍️ Rewriting twitch_clips.py and main.py with trending-creator logic..."
 
-mkdir -p videos/raw videos/processed logs cookies
-
-# -------------------------
-# .env.example
-# -------------------------
-cat > .env.example <<'EOF'
-TWITCH_CLIENT_ID=your_client_id_here
-TWITCH_CLIENT_SECRET=your_client_secret_here
-
-GAME_NAME=Among Us
-LOOKBACK_HOURS=24
-PARTNER_ONLY=true
-
-WHISPER_MODEL=small
-HASHTAGS=#AmongUs #twitch #gaming #fyp
-
-ENABLE_TIKTOK_UPLOAD=false
-TIKTOK_COOKIES_TXT=cookies/cookies.txt
-TIKTOK_HEADLESS=true
-EOF
-
-# -------------------------
-# cookies/README.md
-# -------------------------
-mkdir -p cookies
-cat > cookies/README.md <<'EOF'
-TikTok cookies
-
-This project uses tiktok-uploader for automatic uploads.
-
-You MUST provide a Netscape-format cookies.txt file.
-
-Steps:
-1. Log into TikTok in Chrome (local machine)
-2. Export cookies as cookies.txt (Netscape format)
-3. Place it here: cookies/cookies.txt
-4. DO NOT commit cookies to git
-EOF
-
-# -------------------------
-# twitch_clips.py
-# -------------------------
-cat > twitch_clips.py <<'EOF'
+# ---------- twitch_clips.py ----------
+cat > twitch_clips.py <<'PY'
 import os
 import requests
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 TWITCH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 TWITCH_API_URL = "https://api.twitch.tv/helix"
 
-def _headers(token):
+def _headers(token: str) -> dict:
     return {
         "Client-ID": os.environ["TWITCH_CLIENT_ID"],
         "Authorization": f"Bearer {token}",
     }
 
-def get_app_token(client_id, client_secret):
+def get_app_token(client_id: str, client_secret: str) -> str:
     r = requests.post(
         TWITCH_TOKEN_URL,
         params={
@@ -67,170 +27,183 @@ def get_app_token(client_id, client_secret):
             "client_secret": client_secret,
             "grant_type": "client_credentials",
         },
+        timeout=30,
     )
     r.raise_for_status()
     return r.json()["access_token"]
 
-def get_game_id(game_name, token):
+def get_game_id(game_name: str, token: str) -> str:
     r = requests.get(
         f"{TWITCH_API_URL}/games",
         headers=_headers(token),
         params={"name": game_name},
+        timeout=30,
     )
     r.raise_for_status()
-    return r.json()["data"][0]["id"]
+    data = r.json().get("data", [])
+    if not data:
+        raise RuntimeError(f"Game not found: {game_name}")
+    return data[0]["id"]
 
-def get_top_clip_for_game(game_id, token, lookback_hours=24, partner_only=True):
-    started_at = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).isoformat()
+def _fetch_users(ids: list[str], token: str) -> dict:
+    if not ids:
+        return {}
+    r = requests.get(
+        f"{TWITCH_API_URL}/users",
+        headers=_headers(token),
+        params=[("id", i) for i in ids],
+        timeout=30,
+    )
+    r.raise_for_status()
+    return {u["id"]: u for u in r.json().get("data", [])}
+
+def _fetch_channels(ids: list[str], token: str) -> dict:
+    if not ids:
+        return {}
+    r = requests.get(
+        f"{TWITCH_API_URL}/channels",
+        headers=_headers(token),
+        params=[("broadcaster_id", i) for i in ids],
+        timeout=30,
+    )
+    r.raise_for_status()
+    return {c["broadcaster_id"]: c for c in r.json().get("data", [])}
+
+def get_top_clip_for_game(
+    game_id: str,
+    token: str,
+    lookback_hours: int = 168,
+    fetch_first: int = 100,
+    partner_only: bool = True,
+    english_only: bool = True,
+    min_clips_per_creator: int = 2,
+    creator_clip_bonus: float = 0.35,
+) -> dict:
+    """
+    Selects a trending creator by requiring multiple high-performing clips.
+    """
+
+    started_at = (
+        datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    ).isoformat()
 
     r = requests.get(
         f"{TWITCH_API_URL}/clips",
         headers=_headers(token),
-        params={"game_id": game_id, "first": 50, "started_at": started_at},
+        params={
+            "game_id": game_id,
+            "first": min(fetch_first, 100),
+            "started_at": started_at,
+        },
+        timeout=30,
     )
     r.raise_for_status()
-    clips = r.json()["data"]
+    clips = r.json().get("data", [])
+    if not clips:
+        raise RuntimeError("No clips returned")
+
+    broadcaster_ids = list({c["broadcaster_id"] for c in clips})
+    users = _fetch_users(broadcaster_ids, token)
 
     if partner_only:
-        broadcaster_ids = list({c["broadcaster_id"] for c in clips})
-        users = requests.get(
-            f"{TWITCH_API_URL}/users",
-            headers=_headers(token),
-            params=[("id", uid) for uid in broadcaster_ids],
-        ).json()["data"]
-
-        partners = {u["id"] for u in users if u["broadcaster_type"] == "partner"}
+        partners = {
+            uid for uid, u in users.items()
+            if u.get("broadcaster_type") == "partner"
+        }
         clips = [c for c in clips if c["broadcaster_id"] in partners]
 
-    clips.sort(key=lambda c: c["view_count"], reverse=True)
-    top = clips[0]
+    if english_only:
+        channels = _fetch_channels(broadcaster_ids, token)
+        clips = [
+            c for c in clips
+            if channels.get(c["broadcaster_id"], {}).get("broadcaster_language") == "en"
+        ]
+
+    grouped = defaultdict(list)
+    for c in clips:
+        grouped[c["broadcaster_id"]].append(c)
+
+    scored = []
+    for bid, arr in grouped.items():
+        if len(arr) < min_clips_per_creator:
+            continue
+        total_views = sum(int(x["view_count"]) for x in arr)
+        score = total_views * (1 + creator_clip_bonus * (len(arr) - 1))
+        scored.append((score, bid))
+
+    if not scored:
+        clips.sort(key=lambda c: int(c["view_count"]), reverse=True)
+        top = clips[0]
+    else:
+        scored.sort(reverse=True)
+        best_bid = scored[0][1]
+        arr = grouped[best_bid]
+        arr.sort(key=lambda c: int(c["view_count"]), reverse=True)
+        top = arr[0]
 
     return {
+        "id": top["id"],
         "url": top["url"],
-        "title": top["title"],
+        "title": top.get("title", "").strip(),
         "views": top["view_count"],
-        "broadcaster": top["broadcaster_name"],
+        "broadcaster_name": top["broadcaster_name"],
     }
-EOF
+PY
 
-# -------------------------
-# downloader.py
-# -------------------------
-cat > downloader.py <<'EOF'
-import subprocess
-from pathlib import Path
+# ---------- main.py ----------
+cat > main.py <<'PY'
+from config import (
+    TWITCH_CLIENT_ID,
+    TWITCH_CLIENT_SECRET,
+    GAME_NAME,
+    LOOKBACK_HOURS,
+    FETCH_FIRST,
+    MIN_CLIPS_PER_CREATOR,
+    CREATOR_CLIP_BONUS,
+    RAW_VIDEO,
+    FINAL_VIDEO,
+)
 
-def download_clip(url, output):
-    Path(output).parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["yt-dlp", "-f", "mp4/best", "-o", output, url], check=True)
-EOF
+from twitch_clips import (
+    get_app_token,
+    get_game_id,
+    get_top_clip_for_game,
+)
 
-# -------------------------
-# subtitles.py
-# -------------------------
-cat > subtitles.py <<'EOF'
-from pathlib import Path
-from faster_whisper import WhisperModel
+from downloader import download_clip
 
-def _fmt(t):
-    ms = int(t * 1000)
-    h, ms = divmod(ms, 3600000)
-    m, ms = divmod(ms, 60000)
-    s, ms = divmod(ms, 1000)
-    return f"{h:02}:{m:02}:{s:02},{ms:03}"
+def main():
+    print("🔑 Authenticating with Twitch")
+    token = get_app_token(TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET)
 
-def transcribe_to_srt(video, out, model="small"):
-    Path(out).parent.mkdir(parents=True, exist_ok=True)
-    model = WhisperModel(model, device="cpu", compute_type="int8")
-    segments, _ = model.transcribe(video)
+    print(f"🎮 Resolving game: {GAME_NAME}")
+    game_id = get_game_id(GAME_NAME, token)
 
-    lines = []
-    i = 1
-    for seg in segments:
-        if seg.text.strip():
-            lines += [
-                str(i),
-                f"{_fmt(seg.start)} --> {_fmt(seg.end)}",
-                seg.text.strip(),
-                ""
-            ]
-            i += 1
-
-    Path(out).write_text("\n".join(lines), encoding="utf-8")
-EOF
-
-# -------------------------
-# video.py
-# -------------------------
-cat > video.py <<'EOF'
-import subprocess
-from pathlib import Path
-
-def run(cmd):
-    subprocess.run(cmd, check=True)
-
-def make_vertical(inp, out):
-    Path(out).parent.mkdir(parents=True, exist_ok=True)
-    run([
-        "ffmpeg","-y","-i",inp,
-        "-vf","scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
-        "-c:v","libx264","-crf","23","-preset","fast",
-        "-c:a","aac","-b:a","128k",
-        out
-    ])
-
-def burn_subtitles(inp, srt, out):
-    style = "Fontsize=42,Outline=2,Shadow=1"
-    run([
-        "ffmpeg","-y","-i",inp,
-        "-vf",f"subtitles={srt}:force_style='{style}'",
-        "-c:v","libx264","-crf","23",
-        "-c:a","copy",
-        out
-    ])
-EOF
-
-# -------------------------
-# tiktok_upload.py
-# -------------------------
-cat > tiktok_upload.py <<'EOF'
-import os
-import subprocess
-from pathlib import Path
-
-def upload_to_tiktok(video, caption):
-    cookies = os.getenv("TIKTOK_COOKIES_TXT", "cookies/cookies.txt")
-    if not Path(cookies).exists():
-        raise RuntimeError("cookies.txt missing")
-
-    subprocess.run(
-        ["tiktok-uploader", "-video", video, "-description", caption, "-cookies", cookies],
-        check=True
+    print("📈 Selecting trending creator clip")
+    clip = get_top_clip_for_game(
+        game_id=game_id,
+        token=token,
+        lookback_hours=LOOKBACK_HOURS,
+        fetch_first=FETCH_FIRST,
+        partner_only=True,
+        english_only=True,
+        min_clips_per_creator=MIN_CLIPS_PER_CREATOR,
+        creator_clip_bonus=CREATOR_CLIP_BONUS,
     )
-EOF
 
-# -------------------------
-# Dockerfile
-# -------------------------
-cat > Dockerfile <<'EOF'
-FROM python:3.12-slim
+    print(f"🏆 Selected: {clip['broadcaster_name']} ({clip['views']} views)")
+    print(f"🔗 {clip['url']}")
 
-RUN apt-get update && apt-get install -y \
-    ffmpeg chromium chromium-driver xvfb \
-    libatk-bridge2.0-0 libgtk-3-0 libnss3 \
-    libxcomposite1 libxdamage1 libxrandr2 \
-    libgbm1 libasound2 libdrm2 libxshmfence1 \
-    && rm -rf /var/lib/apt/lists/*
+    download_clip(clip["url"], RAW_VIDEO)
 
-ENV DISPLAY=:99
-WORKDIR /app
-COPY . .
-RUN pip install -r requirements.txt
-CMD ["bash","-lc","xvfb-run -a python main.py"]
-EOF
+    print("✅ Clip downloaded — continuing with existing pipeline")
 
-echo "✅ Additional automation files created."
-echo "Next:"
-echo "  git add ."
-echo "  git commit -m 'Add partner-only Twitch + subtitles + TikTok upload'"
-echo "  git push"
+if __name__ == "__main__":
+    main()
+PY
+
+echo "✅ Files rewritten successfully."
+echo "👉 Next steps:"
+echo "   git status"
+echo "   git commit -am 'Bias clip selection toward trending creators'"
+echo "   git push"
