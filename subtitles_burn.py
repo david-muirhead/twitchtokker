@@ -4,8 +4,7 @@ from pathlib import Path
 def burn_subtitles(video_path: str, srt_path: str, output_path: str):
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-    # Basic readable subtitles
-    # force_style is optional but helps readability
+    # Burn subtitles into the video with readable styling
     vf = f"subtitles={srt_path}:force_style='Fontsize=28,Outline=2,Shadow=1,MarginV=90'"
 
     cmd = [
