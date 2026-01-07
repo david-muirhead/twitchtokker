@@ -40,7 +40,7 @@ def main():
     print(f"🏆 Selected: {clip['broadcaster_name']} ({clip['views']} views)")
     print(f"🔗 {clip['url']}")
 
-    download_clip(clip["url"], RAW_VIDEO)
+    ddownload_clip(url=clip["url"], output_path=RAW_VIDEO)
 
     print("✅ Clip downloaded — continuing with existing pipeline")
 
