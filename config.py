@@ -11,6 +11,8 @@ FETCH_FIRST = int(os.getenv("FETCH_FIRST", "100"))
 GAME_NAME = os.getenv("GAME_NAME", "Among Us").strip()
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "24"))
 PARTNER_ONLY = os.getenv("PARTNER_ONLY", "true").lower() in ("1", "true", "yes", "y")
+MIN_CLIPS_PER_CREATOR = int(os.getenv("MIN_CLIPS_PER_CREATOR", "2"))
+CREATOR_CLIP_BONUS = float(os.getenv("CREATOR_CLIP_BONUS", "0.35"))
 
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small").strip()
 
